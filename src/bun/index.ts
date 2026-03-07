@@ -1,6 +1,9 @@
 import { BrowserView, BrowserWindow, Updater } from "electrobun/bun";
 import type { ElectrobunRPCSchema } from "electrobun/bun";
 
+import { captureCurrentDisplayScreenshot } from "./screenshot";
+import type { CaptureScreenshotResult } from "../shared/screenshot";
+
 const DEV_SERVER_PORT = 4000;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
 
@@ -13,6 +16,14 @@ type AppRPCSchema = ElectrobunRPCSchema & {
 	bun: {
 		requests: {
 			requestFocus: { params: undefined; response: { ok: boolean } };
+			captureCurrentDisplay: {
+				params: undefined;
+				response: CaptureScreenshotResult;
+			};
+			openCapturedImage: {
+				params: { imagePath: string };
+				response: { ok: boolean };
+			};
 		};
 		messages: {};
 	};
@@ -22,13 +33,42 @@ type AppRPCSchema = ElectrobunRPCSchema & {
 	};
 };
 
+let mainWindow: BrowserWindow | null = null;
+
 const rpc = BrowserView.defineRPC<AppRPCSchema>({
 	maxRequestTime: 5000,
 	handlers: {
 		requests: {
-			requestFocus: () => {
+			requestFocus: (): { ok: boolean } => {
+				if (!mainWindow) {
+					return { ok: false };
+				}
 				mainWindow.focus();
 				return { ok: true };
+			},
+			_: async (method, params) => {
+				if (method === "captureCurrentDisplay") {
+					if (!mainWindow) {
+						return {
+							ok: false,
+							reason: "capture_failed",
+							message: "The main window is not ready yet.",
+						} satisfies CaptureScreenshotResult;
+					}
+					return await captureCurrentDisplayScreenshot(mainWindow);
+				}
+
+				if (method === "openCapturedImage") {
+					const { imagePath } = params as { imagePath: string };
+					const proc = Bun.spawn(["open", imagePath], {
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+					const exitCode = await proc.exited;
+					return { ok: exitCode === 0 };
+				}
+
+				throw new Error(`Unhandled RPC request: ${String(method)}`);
 			},
 		},
 	},
@@ -54,7 +94,7 @@ async function getMainViewUrl(): Promise<string> {
 // Create the main application window
 const url = await getMainViewUrl();
 
-const mainWindow = new BrowserWindow({
+mainWindow = new BrowserWindow({
 	title: "theOP",
 	url,
 	titleBarStyle: "hiddenInset",

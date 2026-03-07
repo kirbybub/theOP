@@ -2562,7 +2562,7 @@ function toCString(jsString, addNullTerminator = true) {
   const buff = Buffer.from(jsString + appendWith, "utf8");
   return ptr(buff);
 }
-var menuDataRegistry, menuDataCounter = 0, ELECTROBUN_DELIMITER = "|EB|", native, ffi, windowCloseCallback, windowMoveCallback, windowResizeCallback, windowFocusCallback, getMimeType, getHTMLForWebviewSync, urlOpenCallback, quitRequestedCallback, globalShortcutHandlers, globalShortcutCallback, sessionCache, webviewDecideNavigation, webviewEventHandler = (id, eventName, detail) => {
+var menuDataRegistry, menuDataCounter = 0, ELECTROBUN_DELIMITER = "|EB|", native, ffi, windowCloseCallback, windowMoveCallback, windowResizeCallback, windowFocusCallback, getMimeType, getHTMLForWebviewSync, urlOpenCallback, quitRequestedCallback, globalShortcutHandlers, globalShortcutCallback, Screen, sessionCache, webviewDecideNavigation, webviewEventHandler = (id, eventName, detail) => {
   const webview = BrowserView.getById(id);
   if (!webview) {
     console.error("[webviewEventHandler] No webview found for id:", id);
@@ -3590,6 +3590,53 @@ window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.me
     threadsafe: true
   });
   native.symbols.setGlobalShortcutCallback(globalShortcutCallback);
+  Screen = {
+    getPrimaryDisplay: () => {
+      const jsonStr = native.symbols.getPrimaryDisplay();
+      if (!jsonStr) {
+        return {
+          id: 0,
+          bounds: { x: 0, y: 0, width: 0, height: 0 },
+          workArea: { x: 0, y: 0, width: 0, height: 0 },
+          scaleFactor: 1,
+          isPrimary: true
+        };
+      }
+      try {
+        return JSON.parse(jsonStr.toString());
+      } catch {
+        return {
+          id: 0,
+          bounds: { x: 0, y: 0, width: 0, height: 0 },
+          workArea: { x: 0, y: 0, width: 0, height: 0 },
+          scaleFactor: 1,
+          isPrimary: true
+        };
+      }
+    },
+    getAllDisplays: () => {
+      const jsonStr = native.symbols.getAllDisplays();
+      if (!jsonStr) {
+        return [];
+      }
+      try {
+        return JSON.parse(jsonStr.toString());
+      } catch {
+        return [];
+      }
+    },
+    getCursorScreenPoint: () => {
+      const jsonStr = native.symbols.getCursorScreenPoint();
+      if (!jsonStr) {
+        return { x: 0, y: 0 };
+      }
+      try {
+        return JSON.parse(jsonStr.toString());
+      } catch {
+        return { x: 0, y: 0 };
+      }
+    }
+  };
   sessionCache = new Map;
   webviewDecideNavigation = new JSCallback((_webviewId, _url) => {
     return true;
@@ -4190,19 +4237,179 @@ await __promiseAll([
   init_native()
 ]);
 
+// src/bun/screenshot.ts
+import { mkdir, readFile, stat, unlink } from "fs/promises";
+import { tmpdir as tmpdir2 } from "os";
+import { join as join5 } from "path";
+
+// src/shared/displaySelection.ts
+function getDisplayForWindowFrame(frame, displays) {
+  if (displays.length === 0)
+    return null;
+  const centerX = frame.x + frame.width / 2;
+  const centerY = frame.y + frame.height / 2;
+  const containingDisplay = displays.find((display) => {
+    const { x, y, width, height } = display.bounds;
+    return centerX >= x && centerX < x + width && centerY >= y && centerY < y + height;
+  });
+  return containingDisplay ?? displays.find((display) => display.isPrimary) ?? displays[0];
+}
+
+// src/bun/screenshot.ts
+var CAPTURE_DELAY_MS = 250;
+var captureInFlight = false;
+function sleep(ms) {
+  return new Promise((resolve3) => setTimeout(resolve3, ms));
+}
+async function ensureCaptureDir() {
+  const captureDir = join5(tmpdir2(), "theop", "screenshots");
+  await mkdir(captureDir, { recursive: true });
+  return captureDir;
+}
+async function runScreenCapture(display, outputPath) {
+  const rect = `${display.bounds.x},${display.bounds.y},${display.bounds.width},${display.bounds.height}`;
+  const proc = Bun.spawn(["screencapture", "-x", `-R${rect}`, outputPath], {
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const [exitCode, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text()
+  ]);
+  return { exitCode, stderr: stderr.trim() };
+}
+async function createPreviewDataUrl(imagePath) {
+  const previewPath = join5(tmpdir2(), "theop", `preview-${Date.now()}.jpg`);
+  const proc = Bun.spawn([
+    "sips",
+    "-Z",
+    "480",
+    "-s",
+    "format",
+    "jpeg",
+    imagePath,
+    "--out",
+    previewPath
+  ], {
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    return null;
+  }
+  try {
+    const previewBuffer = await readFile(previewPath);
+    return `data:image/jpeg;base64,${previewBuffer.toString("base64")}`;
+  } finally {
+    await unlink(previewPath).catch(() => {});
+  }
+}
+async function captureCurrentDisplayScreenshot(mainWindow) {
+  if (captureInFlight) {
+    return {
+      ok: false,
+      reason: "busy",
+      message: "A screenshot is already in progress."
+    };
+  }
+  captureInFlight = true;
+  try {
+    const displays = Screen.getAllDisplays();
+    const frame = mainWindow.getFrame();
+    const display = getDisplayForWindowFrame(frame, displays);
+    if (!display) {
+      return {
+        ok: false,
+        reason: "capture_failed",
+        message: "No display was available for capture."
+      };
+    }
+    const captureDir = await ensureCaptureDir();
+    const capturedAt = new Date().toISOString();
+    const imagePath = join5(captureDir, `screenshot-${Date.now()}.png`);
+    mainWindow.minimize();
+    await sleep(CAPTURE_DELAY_MS);
+    const { exitCode, stderr } = await runScreenCapture(display, imagePath);
+    if (mainWindow.isMinimized()) {
+      mainWindow.unminimize();
+    }
+    mainWindow.focus();
+    if (exitCode !== 0) {
+      return {
+        ok: false,
+        reason: "permission_denied",
+        message: stderr || "Screen capture was blocked. Allow screen recording for the app in macOS settings and try again."
+      };
+    }
+    const fileStats = await stat(imagePath);
+    if (!fileStats.isFile() || fileStats.size === 0) {
+      return {
+        ok: false,
+        reason: "capture_failed",
+        message: "The screenshot file was not created correctly."
+      };
+    }
+    return {
+      ok: true,
+      imagePath,
+      previewDataUrl: await createPreviewDataUrl(imagePath),
+      capturedAt
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "capture_failed",
+      message: error instanceof Error ? error.message : "The screenshot failed unexpectedly."
+    };
+  } finally {
+    if (mainWindow.isMinimized()) {
+      mainWindow.unminimize();
+    }
+    mainWindow.focus();
+    captureInFlight = false;
+  }
+}
+
 // src/bun/index.ts
 var DEV_SERVER_PORT = 4000;
 var DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
 var CHAR_SIZE = 200;
 var BUBBLE_HEIGHT = 105;
 var WINDOW_HEIGHT = CHAR_SIZE + BUBBLE_HEIGHT;
+var mainWindow = null;
 var rpc = BrowserView.defineRPC({
   maxRequestTime: 5000,
   handlers: {
     requests: {
       requestFocus: () => {
+        if (!mainWindow) {
+          return { ok: false };
+        }
         mainWindow.focus();
         return { ok: true };
+      },
+      _: async (method, params) => {
+        if (method === "captureCurrentDisplay") {
+          if (!mainWindow) {
+            return {
+              ok: false,
+              reason: "capture_failed",
+              message: "The main window is not ready yet."
+            };
+          }
+          return await captureCurrentDisplayScreenshot(mainWindow);
+        }
+        if (method === "openCapturedImage") {
+          const { imagePath } = params;
+          const proc = Bun.spawn(["open", imagePath], {
+            stdout: "ignore",
+            stderr: "ignore"
+          });
+          const exitCode = await proc.exited;
+          return { ok: exitCode === 0 };
+        }
+        throw new Error(`Unhandled RPC request: ${String(method)}`);
       }
     }
   }
@@ -4221,7 +4428,7 @@ async function getMainViewUrl() {
   return "views://mainview/index.html";
 }
 var url = await getMainViewUrl();
-var mainWindow = new BrowserWindow({
+mainWindow = new BrowserWindow({
   title: "theOP",
   url,
   titleBarStyle: "hiddenInset",

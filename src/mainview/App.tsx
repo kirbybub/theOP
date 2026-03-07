@@ -2,11 +2,21 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { Electroview, type ElectrobunRPCSchema } from "electrobun/view";
 
+import type { CaptureFailureReason, CaptureScreenshotResult } from "../shared/screenshot";
+
 // RPC schema (must mirror the bun side)
 type AppRPCSchema = ElectrobunRPCSchema & {
 	bun: {
 		requests: {
 			requestFocus: { params: undefined; response: { ok: boolean } };
+			captureCurrentDisplay: {
+				params: undefined;
+				response: CaptureScreenshotResult;
+			};
+			openCapturedImage: {
+				params: { imagePath: string };
+				response: { ok: boolean };
+			};
 		};
 		messages: {};
 	};
@@ -158,6 +168,14 @@ export default function App() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragVelRef = useRef({ x: 0, y: 0 });
 	const [bubblesOpen, setBubblesOpen] = useState(false);
+	const [isCapturing, setIsCapturing] = useState(false);
+	const [capturedImagePath, setCapturedImagePath] = useState<string | null>(null);
+	const [capturedPreviewDataUrl, setCapturedPreviewDataUrl] = useState<string | null>(null);
+	const [capturedAt, setCapturedAt] = useState<string | null>(null);
+	const [captureError, setCaptureError] = useState<{
+		reason: CaptureFailureReason;
+		message: string;
+	} | null>(null);
 	const bubblesOpenRef = useRef(false);
 	const inputRef = useRef<HTMLInputElement>(null);
 
@@ -204,8 +222,53 @@ export default function App() {
 		return () => window.removeEventListener("keydown", onKeyDown);
 	}, [bubblesOpen]);
 
-	function toggleBubbles() {
-		setBubblesOpen((prev) => !prev);
+	async function handleCharacterClick() {
+		if (isCapturing) return;
+
+		setIsCapturing(true);
+		setCaptureError(null);
+
+		try {
+			const result = await rpc.request.captureCurrentDisplay();
+				if (result.ok) {
+					setCapturedImagePath(result.imagePath);
+					setCapturedPreviewDataUrl(result.previewDataUrl);
+					setCapturedAt(result.capturedAt);
+					setCaptureError(null);
+				} else {
+					setCapturedImagePath(null);
+					setCapturedPreviewDataUrl(null);
+					setCapturedAt(null);
+					setCaptureError({
+						reason: result.reason,
+					message: result.message,
+				});
+			}
+			setBubblesOpen(true);
+			} catch (error) {
+				setCapturedImagePath(null);
+				setCapturedPreviewDataUrl(null);
+				setCapturedAt(null);
+				setCaptureError({
+					reason: "capture_failed",
+				message:
+					error instanceof Error
+						? error.message
+						: "Something went wrong while taking the screenshot.",
+			});
+			setBubblesOpen(true);
+		} finally {
+			setIsCapturing(false);
+			}
+		}
+
+	async function openCapturedImage() {
+		if (!capturedImagePath) return;
+		try {
+			await rpc.request.openCapturedImage({ imagePath: capturedImagePath });
+		} catch {
+			// Keep failures silent for now; the preview remains visible in-app.
+		}
 	}
 
 	useEffect(() => {
@@ -354,8 +417,8 @@ export default function App() {
 						const downX = Number((e.target as HTMLElement).dataset.downX ?? 0);
 						const downY = Number((e.target as HTMLElement).dataset.downY ?? 0);
 						const dist = Math.hypot(e.screenX - downX, e.screenY - downY);
-						if (dist < 5) {
-							toggleBubbles();
+						if (dist < 5 && !isCapturing) {
+							void handleCharacterClick();
 						}
 					}}
 					onMouseLeave={(e) => {
@@ -376,8 +439,7 @@ export default function App() {
 							justifyContent: "flex-end",
 							padding: "6px 12px 2px",
 						}}
-					>
-						{/* Greeting card */}
+						>
 						<div style={{
 							background: "white",
 							borderRadius: 16,
@@ -388,8 +450,64 @@ export default function App() {
 							color: "#1a1a2e",
 							lineHeight: 1.4,
 						}}>
-							Hey, need help with anything?
+							{captureError?.reason === "permission_denied" ? (
+								<>
+									Allow screen recording for this app in macOS System Settings &gt; Privacy
+									&amp; Security &gt; Screen &amp; System Audio Recording, then click me again.
+								</>
+							) : captureError ? (
+								<>I couldn&apos;t grab the screen: {captureError.message}</>
+							) : (
+								<>
+									I grabbed your screen{capturedAt ? ` at ${new Date(capturedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}. Ask me about it.
+								</>
+							)}
 						</div>
+							{capturedPreviewDataUrl && !captureError && (
+								<div
+									role="button"
+									tabIndex={0}
+									onClick={() => {
+										void openCapturedImage();
+									}}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" || e.key === " ") {
+											e.preventDefault();
+											void openCapturedImage();
+										}
+									}}
+									style={{
+										background: "rgba(255,255,255,0.92)",
+										borderRadius: 16,
+										padding: 8,
+										marginBottom: 6,
+										boxShadow: "0 2px 12px rgba(0,0,0,0.1)",
+										cursor: "pointer",
+									}}
+								>
+									<img
+										src={capturedPreviewDataUrl}
+										alt="Screenshot preview"
+										style={{
+											display: "block",
+										width: "100%",
+										maxHeight: 120,
+										objectFit: "cover",
+											borderRadius: 10,
+										}}
+									/>
+									<div
+										style={{
+											marginTop: 6,
+											fontSize: 11,
+											color: "#5a5a6f",
+											textAlign: "center",
+										}}
+									>
+										Click to open full screenshot
+									</div>
+								</div>
+							)}
 						{/* Input row */}
 						<div style={{ display: "flex", gap: 6 }}>
 							<input
