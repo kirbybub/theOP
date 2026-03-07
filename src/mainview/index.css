@@ -2,6 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Hide traffic light buttons from hiddenInset title bar on transparent window */
+.titlebar-button,
+.traffic-light {
+	display: none !important;
+}
+
 html, body, #root {
 	background: transparent !important;
 	margin: 0;

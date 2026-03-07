@@ -4191,8 +4191,22 @@ await __promiseAll([
 ]);
 
 // src/bun/index.ts
-var DEV_SERVER_PORT = 5173;
+var DEV_SERVER_PORT = 4000;
 var DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
+var CHAR_SIZE = 200;
+var BUBBLE_HEIGHT = 105;
+var WINDOW_HEIGHT = CHAR_SIZE + BUBBLE_HEIGHT;
+var rpc = BrowserView.defineRPC({
+  maxRequestTime: 5000,
+  handlers: {
+    requests: {
+      requestFocus: () => {
+        mainWindow.focus();
+        return { ok: true };
+      }
+    }
+  }
+});
 async function getMainViewUrl() {
   const channel = await Updater.localInfo.channel();
   if (channel === "dev") {
@@ -4210,13 +4224,19 @@ var url = await getMainViewUrl();
 var mainWindow = new BrowserWindow({
   title: "theOP",
   url,
-  titleBarStyle: "hidden",
+  titleBarStyle: "hiddenInset",
   transparent: true,
-  styleMask: ["Borderless", "FullSizeContentView", "NonactivatingPanel"],
+  styleMask: {
+    FullSizeContentView: true,
+    Closable: false,
+    Miniaturizable: false,
+    Resizable: false
+  },
   frame: {
-    width: 200,
-    height: 200,
+    width: CHAR_SIZE,
+    height: WINDOW_HEIGHT,
     x: 500,
     y: 200
-  }
+  },
+  rpc
 });

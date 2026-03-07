@@ -1,5 +1,27 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { Electroview, type ElectrobunRPCSchema } from "electrobun/view";
+
+// RPC schema (must mirror the bun side)
+type AppRPCSchema = ElectrobunRPCSchema & {
+	bun: {
+		requests: {
+			requestFocus: { params: undefined; response: { ok: boolean } };
+		};
+		messages: {};
+	};
+	webview: {
+		requests: {};
+		messages: {};
+	};
+};
+
+const rpc = Electroview.defineRPC<AppRPCSchema>({
+	handlers: {},
+});
+
+// Initialize RPC transport (must be instantiated for rpc to work)
+new Electroview({ rpc });
 
 function createCharacter() {
 	const bodyColor = 0x40e0d0;
@@ -113,6 +135,8 @@ function createCharacter() {
 	return { root, arms };
 }
 
+const CHAR_SIZE = 200;
+
 // Simple spring for arm rotation
 class Spring {
 	value = 0;
@@ -133,6 +157,56 @@ class Spring {
 export default function App() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragVelRef = useRef({ x: 0, y: 0 });
+	const [bubblesOpen, setBubblesOpen] = useState(false);
+	const bubblesOpenRef = useRef(false);
+	const inputRef = useRef<HTMLInputElement>(null);
+
+	const focusInput = useCallback(() => {
+		const input = inputRef.current;
+		if (!input) return;
+		input.focus({ preventScroll: true });
+	}, []);
+
+	// Keep ref in sync with state for use in animation loop
+	useEffect(() => {
+		bubblesOpenRef.current = bubblesOpen;
+	}, [bubblesOpen]);
+
+	// Request window focus, then keep trying input focus until it sticks
+	useEffect(() => {
+		if (!bubblesOpen) return;
+
+		let cancelled = false;
+		const focusAfterOpen = async () => {
+			try {
+				await rpc.request.requestFocus();
+			} catch {
+				// Fall back to input-only focus if native focus request fails.
+			}
+			if (cancelled || !bubblesOpenRef.current) return;
+			requestAnimationFrame(() => focusInput());
+		};
+
+		void focusAfterOpen();
+		return () => {
+			cancelled = true;
+		};
+	}, [bubblesOpen, focusInput]);
+
+	// Escape key to close bubbles
+	useEffect(() => {
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape" && bubblesOpen) {
+				setBubblesOpen(false);
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [bubblesOpen]);
+
+	function toggleBubbles() {
+		setBubblesOpen((prev) => !prev);
+	}
 
 	useEffect(() => {
 		const container = containerRef.current;
@@ -169,6 +243,8 @@ export default function App() {
 		const rightArmSpring = new Spring(500, 22);
 		// Spring for body tilt
 		const bodyTiltSpring = new Spring(400, 25);
+		// Spring for right arm raise when bubbles open
+		const rightArmUpSpring = new Spring(200, 16);
 
 		// Mouse tracking for drag
 		let dragging = false;
@@ -176,6 +252,8 @@ export default function App() {
 		let lastMouseY = 0;
 
 		const onMouseDown = (e: MouseEvent) => {
+			// Only start drag tracking when the event originates from the canvas/character area
+			if (!container.contains(e.target as Node)) return;
 			dragging = true;
 			lastMouseX = e.screenX;
 			lastMouseY = e.screenY;
@@ -222,11 +300,15 @@ export default function App() {
 			rightArmSpring.update(0, dt, 0.3);
 			rightArmSpring.velocity += dx * 1.5;
 
-			arms[0].rotation.z = leftArmSpring.value;
-			arms[1].rotation.z = rightArmSpring.value;
+			// Right arm raise animation
+			const armUpTarget = bubblesOpenRef.current ? 1.2 : 0;
+			rightArmUpSpring.update(armUpTarget, dt);
 
-			// Gentle idle bob
-			root.position.y = Math.sin(t * 1.5) * 0.04;
+			arms[0].rotation.z = leftArmSpring.value;
+			arms[1].rotation.z = rightArmSpring.value + rightArmUpSpring.value;
+
+			// Gentle idle bob, offset upward so head is near top of container
+			root.position.y = 0.35 + Math.sin(t * 1.5) * 0.04;
 
 			renderer.render(scene, camera);
 		}
@@ -243,29 +325,119 @@ export default function App() {
 	}, []);
 
 	return (
-		<div style={{ position: "fixed", inset: 0 }}>
-			<div
-				ref={containerRef}
-				style={{ position: "absolute", inset: 0 }}
-			/>
-			<div
-				className="electrobun-webkit-app-region-drag"
-				style={{
-					position: "absolute",
-					inset: 0,
-					zIndex: 10,
-					cursor: "pointer",
-				}}
-				onMouseDown={(e) => {
-					(e.target as HTMLElement).style.cursor = "grabbing";
-				}}
-				onMouseUp={(e) => {
-					(e.target as HTMLElement).style.cursor = "pointer";
-				}}
-				onMouseLeave={(e) => {
-					(e.target as HTMLElement).style.cursor = "pointer";
-				}}
-			/>
+		<div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+			{/* Character area — fills window, with bubbles overlaid above */}
+			<div style={{ flex: 1, position: "relative" }}>
+				<div
+					ref={containerRef}
+					style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: CHAR_SIZE }}
+				/>
+				{/* Drag overlay — only covers the character area at the bottom */}
+				<div
+					className="electrobun-webkit-app-region-drag"
+					style={{
+						position: "absolute",
+						left: 0,
+						right: 0,
+						bottom: 0,
+						height: CHAR_SIZE,
+						zIndex: 10,
+						cursor: "pointer",
+					}}
+					onMouseDown={(e) => {
+						(e.target as HTMLElement).style.cursor = "grabbing";
+						(e.target as HTMLElement).dataset.downX = String(e.screenX);
+						(e.target as HTMLElement).dataset.downY = String(e.screenY);
+					}}
+					onMouseUp={(e) => {
+						(e.target as HTMLElement).style.cursor = "pointer";
+						const downX = Number((e.target as HTMLElement).dataset.downX ?? 0);
+						const downY = Number((e.target as HTMLElement).dataset.downY ?? 0);
+						const dist = Math.hypot(e.screenX - downX, e.screenY - downY);
+						if (dist < 5) {
+							toggleBubbles();
+						}
+					}}
+					onMouseLeave={(e) => {
+						(e.target as HTMLElement).style.cursor = "pointer";
+					}}
+				/>
+				{/* Bubble area — positioned above the character, inside the same container */}
+				{bubblesOpen && (
+					<div
+						style={{
+							position: "absolute",
+							left: 0,
+							right: 0,
+							bottom: CHAR_SIZE,
+							zIndex: 20,
+							display: "flex",
+							flexDirection: "column",
+							justifyContent: "flex-end",
+							padding: "6px 12px 2px",
+						}}
+					>
+						{/* Greeting card */}
+						<div style={{
+							background: "white",
+							borderRadius: 16,
+							padding: "10px 14px",
+							marginBottom: 6,
+							boxShadow: "0 2px 12px rgba(0,0,0,0.12)",
+							fontSize: 13,
+							color: "#1a1a2e",
+							lineHeight: 1.4,
+						}}>
+							Hey, need help with anything?
+						</div>
+						{/* Input row */}
+						<div style={{ display: "flex", gap: 6 }}>
+							<input
+								ref={inputRef}
+								autoFocus
+								type="text"
+								placeholder="Ask me anything..."
+								style={{
+									flex: 1,
+									padding: "8px 12px",
+									borderRadius: 12,
+									border: "1px solid #e0e0e0",
+									fontSize: 13,
+									outline: "none",
+									background: "white",
+									color: "#1a1a2e",
+								}}
+								onFocus={(e) => e.target.style.borderColor = "#40e0d0"}
+								onBlur={(e) => e.target.style.borderColor = "#e0e0e0"}
+								onKeyDown={(e) => {
+									if (e.key === "Enter") {
+										// TODO: handle submit
+									}
+								}}
+							/>
+							<button
+								type="button"
+								style={{
+									width: 36,
+									height: 36,
+									borderRadius: 12,
+									border: "none",
+									background: "#40e0d0",
+									color: "white",
+									fontSize: 16,
+									cursor: "pointer",
+									display: "flex",
+									alignItems: "center",
+									justifyContent: "center",
+									flexShrink: 0,
+								}}
+							>
+								&#8593;
+							</button>
+						</div>
+					</div>
+				)}
+			</div>
 		</div>
 	);
 }

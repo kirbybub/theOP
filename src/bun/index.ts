@@ -1,7 +1,38 @@
-import { BrowserWindow, Updater } from "electrobun/bun";
+import { BrowserView, BrowserWindow, Updater } from "electrobun/bun";
+import type { ElectrobunRPCSchema } from "electrobun/bun";
 
-const DEV_SERVER_PORT = 5173;
+const DEV_SERVER_PORT = 4000;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
+
+const CHAR_SIZE = 200;
+const BUBBLE_HEIGHT = 105;
+const WINDOW_HEIGHT = CHAR_SIZE + BUBBLE_HEIGHT;
+
+// RPC schema
+type AppRPCSchema = ElectrobunRPCSchema & {
+	bun: {
+		requests: {
+			requestFocus: { params: undefined; response: { ok: boolean } };
+		};
+		messages: {};
+	};
+	webview: {
+		requests: {};
+		messages: {};
+	};
+};
+
+const rpc = BrowserView.defineRPC<AppRPCSchema>({
+	maxRequestTime: 5000,
+	handlers: {
+		requests: {
+			requestFocus: () => {
+				mainWindow.focus();
+				return { ok: true };
+			},
+		},
+	},
+});
 
 // Check if Vite dev server is running for HMR
 async function getMainViewUrl(): Promise<string> {
@@ -26,13 +57,19 @@ const url = await getMainViewUrl();
 const mainWindow = new BrowserWindow({
 	title: "theOP",
 	url,
-	titleBarStyle: "hidden",
+	titleBarStyle: "hiddenInset",
 	transparent: true,
-	styleMask: ["Borderless", "FullSizeContentView", "NonactivatingPanel"],
+	styleMask: {
+		FullSizeContentView: true,
+		Closable: false,
+		Miniaturizable: false,
+		Resizable: false,
+	},
 	frame: {
-		width: 200,
-		height: 200,
+		width: CHAR_SIZE,
+		height: WINDOW_HEIGHT,
 		x: 500,
 		y: 200,
 	},
+	rpc,
 });
