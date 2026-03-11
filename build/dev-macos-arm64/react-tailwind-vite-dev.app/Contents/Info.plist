@@ -14,5 +14,7 @@
     <string>APPL</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>We use your microphone so you can ask about your current screen with your voice.</string>
 </dict>
 </plist>

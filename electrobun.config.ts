@@ -14,6 +14,10 @@ export default {
 		},
 		mac: {
 			bundleCEF: false,
+			entitlements: {
+				"com.apple.security.device.microphone":
+					"We use your microphone so you can ask about your current screen with your voice.",
+			},
 		},
 		linux: {
 			bundleCEF: false,
@@ -23,5 +27,4 @@ export default {
 		},
 	},
 } satisfies ElectrobunConfig;
-
 

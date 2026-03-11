@@ -4237,10 +4237,439 @@ await __promiseAll([
   init_native()
 ]);
 
-// src/bun/screenshot.ts
-import { mkdir, readFile, stat, unlink } from "fs/promises";
-import { tmpdir as tmpdir2 } from "os";
+// src/bun/index.ts
+import { readFile as readFile3 } from "fs/promises";
+
+// shared/agent.ts
+function getPointAction(actions) {
+  for (const action of actions) {
+    if (action.type === "POINT") {
+      return action;
+    }
+  }
+  return null;
+}
+
+// src/bun/cloudAgent.ts
+import { readFile } from "fs/promises";
+
+// src/bun/threadStore.ts
+var activeThread = null;
+function createThread() {
+  return {
+    threadId: crypto.randomUUID(),
+    goal: null,
+    turns: [],
+    screenshots: [],
+    latestAgentActionPlan: null
+  };
+}
+function ensureActiveThread() {
+  if (!activeThread) {
+    activeThread = createThread();
+  }
+  return activeThread;
+}
+function getActiveThread() {
+  return ensureActiveThread();
+}
+function recordScreenshot(screenshot) {
+  const thread = ensureActiveThread();
+  thread.screenshots.push(screenshot);
+  return thread;
+}
+function recordUserTurn(questionText, inputMode) {
+  const thread = ensureActiveThread();
+  if (!thread.goal) {
+    thread.goal = questionText;
+  }
+  thread.turns.push({
+    id: crypto.randomUUID(),
+    role: "user",
+    text: questionText,
+    inputMode,
+    createdAt: new Date().toISOString()
+  });
+  return thread;
+}
+function recordAssistantTurn(response) {
+  const thread = ensureActiveThread();
+  thread.latestAgentActionPlan = response;
+  thread.turns.push({
+    id: crypto.randomUUID(),
+    role: "assistant",
+    text: response.summary,
+    createdAt: new Date().toISOString()
+  });
+  return thread;
+}
+function getRecentScreenshots(limit = 4) {
+  const thread = ensureActiveThread();
+  return thread.screenshots.slice(-limit);
+}
+function getScreenshotById(screenshotId) {
+  const thread = ensureActiveThread();
+  return thread.screenshots.find((screenshot) => screenshot.screenshotId === screenshotId) ?? null;
+}
+
+// src/bun/cloudAgent.ts
+var DEFAULT_AGENT_PATH = "/assist";
+var ASSISTANT_FETCH_TIMEOUT_MS = 30000;
+function getAgentBaseUrl() {
+  const raw = process.env["THEOP_AGENT_URL"] ?? process.env["THEOP_CLOUD_AGENT_URL"] ?? "";
+  return raw.replace(/\/+$/, "");
+}
+async function buildScreenshotInput(screenshot) {
+  const imageBuffer = await readFile(screenshot.modelImagePath);
+  return {
+    screenshotId: screenshot.screenshotId,
+    mimeType: screenshot.modelMimeType,
+    bytesBase64: imageBuffer.toString("base64"),
+    width: screenshot.displayContext.imageWidth,
+    height: screenshot.displayContext.imageHeight,
+    capturedAt: screenshot.capturedAt,
+    displayContext: screenshot.displayContext,
+    appContext: screenshot.appContext
+  };
+}
+function isAssistResponse(value) {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value;
+  return typeof candidate.summary === "string" && Array.isArray(candidate.steps) && Array.isArray(candidate.actions) && typeof candidate.needsMoreContext === "boolean" && (candidate.followUpQuestion === null || typeof candidate.followUpQuestion === "string");
+}
+async function askCloudAgent(questionText, inputMode) {
+  const agentBaseUrl = getAgentBaseUrl();
+  if (!agentBaseUrl) {
+    return {
+      ok: false,
+      message: "Set THEOP_AGENT_URL to your Cloud Run service URL before asking the assistant."
+    };
+  }
+  const screenshots = getRecentScreenshots();
+  if (screenshots.length === 0) {
+    return {
+      ok: false,
+      message: "Take a screenshot before asking the assistant."
+    };
+  }
+  const thread = getActiveThread();
+  const screenshotInputs = await Promise.all(screenshots.map((screenshot) => buildScreenshotInput(screenshot)));
+  const activeScreenshot = screenshots[screenshots.length - 1];
+  const request = {
+    threadId: thread.threadId,
+    questionText,
+    screenshots: screenshotInputs,
+    activeScreenshotId: activeScreenshot.screenshotId,
+    displayContext: activeScreenshot.displayContext,
+    appContext: activeScreenshot.appContext,
+    inputMode
+  };
+  const controller = new AbortController;
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Cloud agent request timed out after ${ASSISTANT_FETCH_TIMEOUT_MS}ms.`));
+  }, ASSISTANT_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${agentBaseUrl}${DEFAULT_AGENT_PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        message: `Cloud agent request timed out after ${ASSISTANT_FETCH_TIMEOUT_MS}ms.`
+      };
+    }
+    if (error instanceof Error) {
+      return {
+        ok: false,
+        message: error.message
+      };
+    }
+    return {
+      ok: false,
+      message: "Cloud agent request failed unexpectedly."
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    return {
+      ok: false,
+      message: bodyText || `Cloud agent request failed with status ${response.status}.`
+    };
+  }
+  const data = await response.json();
+  if (!isAssistResponse(data)) {
+    return {
+      ok: false,
+      message: "Cloud agent returned an invalid response payload."
+    };
+  }
+  return {
+    ok: true,
+    response: {
+      ...data,
+      actions: data.actions,
+      steps: data.steps
+    }
+  };
+}
+
+// src/bun/nativeMic.ts
+import { mkdir, stat } from "fs/promises";
 import { join as join5 } from "path";
+import { fileURLToPath } from "url";
+var micProcess = null;
+var stopRequested = false;
+var helperSourcePath = fileURLToPath(new URL("./nativeMic.swift", import.meta.url));
+async function startNativeMicCapture(senders) {
+  if (micProcess) {
+    return {
+      ok: false,
+      message: "Native microphone capture is already running."
+    };
+  }
+  const helperPath = await ensureNativeMicHelper();
+  senders.sendStatus({ state: "starting" });
+  console.log("[native-mic] launching helper", { helperPath });
+  stopRequested = false;
+  const proc = Bun.spawn([helperPath], {
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  micProcess = proc;
+  pumpStdout(proc.stdout, senders);
+  pumpStderr(proc.stderr);
+  proc.exited.then((exitCode) => {
+    console.log("[native-mic] helper exited", { exitCode, stopRequested });
+    micProcess = null;
+    if (stopRequested) {
+      senders.sendStatus({ state: "stopped" });
+      return;
+    }
+    senders.sendStatus({
+      state: "error",
+      message: `Native microphone helper exited with code ${exitCode}.`
+    });
+  });
+  return { ok: true };
+}
+async function stopNativeMicCapture(senders) {
+  if (!micProcess) {
+    return { ok: true };
+  }
+  stopRequested = true;
+  micProcess.kill();
+  micProcess = null;
+  senders.sendStatus({ state: "stopped" });
+  return { ok: true };
+}
+async function ensureNativeMicHelper() {
+  const helperDir = join5(exports_Utils.paths.cache, "theop", "bin");
+  const helperPath = join5(helperDir, "native-mic-capture");
+  await mkdir(helperDir, { recursive: true });
+  const shouldBuild = await needsBuild(helperPath);
+  if (!shouldBuild) {
+    return helperPath;
+  }
+  console.log("[native-mic] compiling helper");
+  const compileProc = Bun.spawn(["xcrun", "swiftc", helperSourcePath, "-o", helperPath], {
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const [exitCode, stderr, stdout] = await Promise.all([
+    compileProc.exited,
+    new Response(compileProc.stderr).text(),
+    new Response(compileProc.stdout).text()
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`Failed to compile native microphone helper.
+${stdout}
+${stderr}`.trim());
+  }
+  return helperPath;
+}
+async function needsBuild(helperPath) {
+  try {
+    const [helperStats, sourceStats] = await Promise.all([
+      stat(helperPath),
+      stat(helperSourcePath)
+    ]);
+    return sourceStats.mtimeMs > helperStats.mtimeMs;
+  } catch {
+    return true;
+  }
+}
+async function pumpStdout(stream, senders) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  let pending = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      pending += decoder.decode(value, { stream: true });
+      pending = parsePendingLines(pending, senders);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+function parsePendingLines(pending, senders) {
+  let buffer = pending;
+  while (true) {
+    const newlineIndex = buffer.indexOf(`
+`);
+    if (newlineIndex === -1) {
+      return buffer;
+    }
+    const line = buffer.slice(0, newlineIndex).trim();
+    buffer = buffer.slice(newlineIndex + 1);
+    if (!line) {
+      continue;
+    }
+    try {
+      const event = JSON.parse(line);
+      handleEvent(event, senders);
+    } catch (error) {
+      console.error("[native-mic] failed to parse helper output", error, line);
+    }
+  }
+}
+function handleEvent(event, senders) {
+  switch (event.type) {
+    case "ready":
+      console.log("[native-mic] ready", event);
+      senders.sendStatus({ state: "ready" });
+      return;
+    case "permission_denied":
+      console.error("[native-mic] permission denied", event.message);
+      senders.sendStatus({
+        state: "permission_denied",
+        message: event.message ?? "Microphone access was denied."
+      });
+      return;
+    case "error":
+      console.error("[native-mic] helper error", event.message);
+      senders.sendStatus({
+        state: "error",
+        message: event.message ?? "Native microphone capture failed."
+      });
+      return;
+    case "chunk":
+      if (!event.pcm16Base64 || !event.sampleRate) {
+        return;
+      }
+      senders.sendChunk({
+        pcm16Base64: event.pcm16Base64,
+        sampleRate: event.sampleRate
+      });
+      return;
+  }
+}
+async function pumpStderr(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  let output = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      output += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (output.trim()) {
+    console.error("[native-mic] stderr", output.trim());
+  }
+}
+
+// src/bun/screenshot.ts
+import { mkdir as mkdir3, readFile as readFile2, stat as stat3, unlink } from "fs/promises";
+import { join as join7 } from "path";
+
+// src/bun/appContext.ts
+import { mkdir as mkdir2, stat as stat2 } from "fs/promises";
+import { join as join6 } from "path";
+import { fileURLToPath as fileURLToPath2 } from "url";
+var helperSourcePath2 = fileURLToPath2(new URL("./appContext.swift", import.meta.url));
+async function getCurrentAppContext() {
+  try {
+    const helperPath = await ensureAppContextHelper();
+    const proc = Bun.spawn([helperPath], {
+      stdout: "pipe",
+      stderr: "pipe"
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text()
+    ]);
+    if (exitCode !== 0) {
+      console.error("[app-context] helper failed", { exitCode, stderr });
+      return emptyAppContext();
+    }
+    return JSON.parse(stdout);
+  } catch (error) {
+    console.error("[app-context] failed to capture app context", error);
+    return emptyAppContext();
+  }
+}
+function emptyAppContext() {
+  return {
+    frontmostApp: null,
+    visibleApps: []
+  };
+}
+async function ensureAppContextHelper() {
+  const helperDir = join6(exports_Utils.paths.cache, "theop", "bin");
+  const helperPath = join6(helperDir, "app-context-helper");
+  await mkdir2(helperDir, { recursive: true });
+  const shouldBuild = await needsBuild2(helperPath);
+  if (!shouldBuild) {
+    return helperPath;
+  }
+  const compileProc = Bun.spawn(["xcrun", "swiftc", helperSourcePath2, "-o", helperPath], {
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const [exitCode, stderr, stdout] = await Promise.all([
+    compileProc.exited,
+    new Response(compileProc.stderr).text(),
+    new Response(compileProc.stdout).text()
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`Failed to compile app-context helper.
+${stdout}
+${stderr}`.trim());
+  }
+  return helperPath;
+}
+async function needsBuild2(helperPath) {
+  try {
+    const [helperStats, sourceStats] = await Promise.all([
+      stat2(helperPath),
+      stat2(helperSourcePath2)
+    ]);
+    return sourceStats.mtimeMs > helperStats.mtimeMs;
+  } catch {
+    return true;
+  }
+}
 
 // src/shared/displaySelection.ts
 function getDisplayForWindowFrame(frame, displays) {
@@ -4257,13 +4686,15 @@ function getDisplayForWindowFrame(frame, displays) {
 
 // src/bun/screenshot.ts
 var CAPTURE_DELAY_MS = 250;
+var MODEL_IMAGE_MAX_EDGE = 1600;
+var PREVIEW_IMAGE_MAX_EDGE = 480;
 var captureInFlight = false;
 function sleep(ms) {
   return new Promise((resolve3) => setTimeout(resolve3, ms));
 }
 async function ensureCaptureDir() {
-  const captureDir = join5(tmpdir2(), "theop", "screenshots");
-  await mkdir(captureDir, { recursive: true });
+  const captureDir = join7(exports_Utils.paths.cache, "theop", "screenshots");
+  await mkdir3(captureDir, { recursive: true });
   return captureDir;
 }
 async function runScreenCapture(display, outputPath) {
@@ -4278,35 +4709,84 @@ async function runScreenCapture(display, outputPath) {
   ]);
   return { exitCode, stderr: stderr.trim() };
 }
-async function createPreviewDataUrl(imagePath) {
-  const previewPath = join5(tmpdir2(), "theop", `preview-${Date.now()}.jpg`);
+async function createDerivativeImage(inputPath, outputPath, maxEdge) {
   const proc = Bun.spawn([
     "sips",
     "-Z",
-    "480",
+    String(maxEdge),
     "-s",
     "format",
     "jpeg",
-    imagePath,
+    inputPath,
     "--out",
-    previewPath
+    outputPath
   ], {
     stdout: "pipe",
     stderr: "pipe"
   });
-  const exitCode = await proc.exited;
+  return await proc.exited;
+}
+async function createPreviewDataUrl(imagePath, screenshotId) {
+  const previewPath = join7(await ensureCaptureDir(), `${screenshotId}-preview.jpg`);
+  const exitCode = await createDerivativeImage(imagePath, previewPath, PREVIEW_IMAGE_MAX_EDGE);
   if (exitCode !== 0) {
     return null;
   }
   try {
-    const previewBuffer = await readFile(previewPath);
+    const previewBuffer = await readFile2(previewPath);
     return `data:image/jpeg;base64,${previewBuffer.toString("base64")}`;
   } finally {
     await unlink(previewPath).catch(() => {});
   }
 }
+async function createModelImage(imagePath, screenshotId) {
+  const modelImagePath = join7(await ensureCaptureDir(), `${screenshotId}-model.jpg`);
+  const exitCode = await createDerivativeImage(imagePath, modelImagePath, MODEL_IMAGE_MAX_EDGE);
+  if (exitCode !== 0) {
+    return {
+      modelImagePath: imagePath,
+      modelMimeType: "image/png"
+    };
+  }
+  return {
+    modelImagePath,
+    modelMimeType: "image/jpeg"
+  };
+}
+async function getImageDimensions(imagePath) {
+  const proc = Bun.spawn(["sips", "-g", "pixelWidth", "-g", "pixelHeight", imagePath], {
+    stdout: "pipe",
+    stderr: "ignore"
+  });
+  const [exitCode, output] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text()
+  ]);
+  if (exitCode !== 0) {
+    throw new Error("Failed to read screenshot dimensions.");
+  }
+  const widthMatch = output.match(/pixelWidth:\s+(\d+)/);
+  const heightMatch = output.match(/pixelHeight:\s+(\d+)/);
+  if (!widthMatch || !heightMatch) {
+    throw new Error("Screenshot dimensions were not available.");
+  }
+  return {
+    width: Number(widthMatch[1]),
+    height: Number(heightMatch[1])
+  };
+}
+function buildDisplayContext(display, imageWidth, imageHeight) {
+  return {
+    displayId: display.id,
+    bounds: { ...display.bounds },
+    scaleFactor: display.scaleFactor,
+    imageWidth,
+    imageHeight
+  };
+}
 async function captureCurrentDisplayScreenshot(mainWindow) {
   if (captureInFlight) {
+    console.error("[screenshot] capture rejected: already in flight");
     return {
       ok: false,
       reason: "busy",
@@ -4319,6 +4799,7 @@ async function captureCurrentDisplayScreenshot(mainWindow) {
     const frame = mainWindow.getFrame();
     const display = getDisplayForWindowFrame(frame, displays);
     if (!display) {
+      console.error("[screenshot] no display found for window frame", frame);
       return {
         ok: false,
         reason: "capture_failed",
@@ -4327,36 +4808,67 @@ async function captureCurrentDisplayScreenshot(mainWindow) {
     }
     const captureDir = await ensureCaptureDir();
     const capturedAt = new Date().toISOString();
-    const imagePath = join5(captureDir, `screenshot-${Date.now()}.png`);
+    const screenshotId = crypto.randomUUID();
+    const imagePath = join7(captureDir, `${screenshotId}.png`);
+    console.log("[screenshot] starting capture", {
+      screenshotId,
+      displayId: display.id,
+      displayBounds: display.bounds,
+      imagePath
+    });
     mainWindow.minimize();
     await sleep(CAPTURE_DELAY_MS);
+    const appContext = await getCurrentAppContext();
     const { exitCode, stderr } = await runScreenCapture(display, imagePath);
     if (mainWindow.isMinimized()) {
       mainWindow.unminimize();
     }
     mainWindow.focus();
     if (exitCode !== 0) {
+      console.error("[screenshot] screencapture failed", {
+        exitCode,
+        stderr
+      });
       return {
         ok: false,
         reason: "permission_denied",
         message: stderr || "Screen capture was blocked. Allow screen recording for the app in macOS settings and try again."
       };
     }
-    const fileStats = await stat(imagePath);
+    const fileStats = await stat3(imagePath);
     if (!fileStats.isFile() || fileStats.size === 0) {
+      console.error("[screenshot] output file missing or empty", {
+        imagePath,
+        size: fileStats.size
+      });
       return {
         ok: false,
         reason: "capture_failed",
         message: "The screenshot file was not created correctly."
       };
     }
+    const imageDimensions = await getImageDimensions(imagePath);
+    const displayContext = buildDisplayContext(display, imageDimensions.width, imageDimensions.height);
+    const modelImage = await createModelImage(imagePath, screenshotId);
+    console.log("[screenshot] capture complete", {
+      screenshotId,
+      imagePath,
+      modelImagePath: modelImage.modelImagePath,
+      imageDimensions
+    });
     return {
       ok: true,
+      screenshotId,
       imagePath,
-      previewDataUrl: await createPreviewDataUrl(imagePath),
-      capturedAt
+      modelImagePath: modelImage.modelImagePath,
+      modelMimeType: modelImage.modelMimeType,
+      previewDataUrl: await createPreviewDataUrl(imagePath, screenshotId),
+      capturedAt,
+      displayContext,
+      appContext
     };
   } catch (error) {
+    console.error("[screenshot] unexpected failure", error);
     return {
       ok: false,
       reason: "capture_failed",
@@ -4374,12 +4886,24 @@ async function captureCurrentDisplayScreenshot(mainWindow) {
 // src/bun/index.ts
 var DEV_SERVER_PORT = 4000;
 var DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
-var CHAR_SIZE = 200;
-var BUBBLE_HEIGHT = 105;
+var CHAR_SIZE = 220;
+var BUBBLE_HEIGHT = 145;
 var WINDOW_HEIGHT = CHAR_SIZE + BUBBLE_HEIGHT;
+var WINDOW_WIDTH = 240;
+function getLiveWebSocketUrl() {
+  const agentBaseUrl = getAgentBaseUrl();
+  if (!agentBaseUrl) {
+    return "";
+  }
+  return `${agentBaseUrl.replace(/^http/i, "ws")}/live`;
+}
 var mainWindow = null;
+var overlayWindow = null;
+var overlayHideTimeout = null;
+var OVERLAY_PADDING = 20;
+var OVERLAY_LABEL_HEIGHT = 42;
 var rpc = BrowserView.defineRPC({
-  maxRequestTime: 5000,
+  maxRequestTime: 45000,
   handlers: {
     requests: {
       requestFocus: () => {
@@ -4389,27 +4913,136 @@ var rpc = BrowserView.defineRPC({
         mainWindow.focus();
         return { ok: true };
       },
-      _: async (method, params) => {
-        if (method === "captureCurrentDisplay") {
-          if (!mainWindow) {
-            return {
-              ok: false,
-              reason: "capture_failed",
-              message: "The main window is not ready yet."
-            };
+      captureCurrentDisplay: async () => {
+        if (!mainWindow) {
+          return {
+            ok: false,
+            reason: "capture_failed",
+            message: "The main window is not ready yet."
+          };
+        }
+        const captureResult = await captureCurrentDisplayScreenshot(mainWindow);
+        if (captureResult.ok) {
+          recordScreenshot(captureResult);
+        }
+        return captureResult;
+      },
+      startVoiceTurn: async () => {
+        if (!mainWindow) {
+          return {
+            ok: false,
+            reason: "capture_failed",
+            message: "The main window is not ready yet."
+          };
+        }
+        const captureResult = await captureCurrentDisplayScreenshot(mainWindow);
+        if (!captureResult.ok) {
+          return captureResult;
+        }
+        recordScreenshot(captureResult);
+        const thread = getActiveThread();
+        const modelImage = await readFile3(captureResult.modelImagePath);
+        return {
+          ok: true,
+          threadId: thread.threadId,
+          liveWebSocketUrl: getLiveWebSocketUrl(),
+          screenshotId: captureResult.screenshotId,
+          imagePath: captureResult.imagePath,
+          previewDataUrl: captureResult.previewDataUrl,
+          capturedAt: captureResult.capturedAt,
+          displayContext: captureResult.displayContext,
+          appContext: captureResult.appContext,
+          modelMimeType: captureResult.modelMimeType,
+          modelImageBase64: modelImage.toString("base64")
+        };
+      },
+      startNativeMic: async () => {
+        return await startNativeMicCapture({
+          sendStatus: (payload) => {
+            rpc.send.nativeMicStatus(payload);
+          },
+          sendChunk: (payload) => {
+            rpc.send.nativeMicChunk(payload);
           }
-          return await captureCurrentDisplayScreenshot(mainWindow);
+        });
+      },
+      stopNativeMic: async () => {
+        return await stopNativeMicCapture({
+          sendStatus: (payload) => {
+            rpc.send.nativeMicStatus(payload);
+          },
+          sendChunk: (payload) => {
+            rpc.send.nativeMicChunk(payload);
+          }
+        });
+      },
+      openCapturedImage: async ({
+        imagePath
+      }) => {
+        const proc = Bun.spawn(["open", imagePath], {
+          stdout: "ignore",
+          stderr: "ignore"
+        });
+        const exitCode = await proc.exited;
+        return { ok: exitCode === 0 };
+      },
+      askAssistant: async ({
+        questionText,
+        inputMode
+      }) => {
+        const startedAt = Date.now();
+        const startedAtIso = new Date(startedAt).toISOString();
+        const initialScreenshotCount = getRecentScreenshots().length;
+        const agentUrl = getAgentBaseUrl();
+        const buildDebug = (overrides) => ({
+          agentUrl,
+          screenshotCount: initialScreenshotCount,
+          startedAt: startedAtIso,
+          finishedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAt,
+          pointDecision: "request_failed",
+          pointAction: null,
+          requestTimedOut: false,
+          responseReceived: false,
+          ...overrides
+        });
+        recordUserTurn(questionText, inputMode);
+        const result = await askCloudAgent(questionText, inputMode);
+        if (result.ok) {
+          recordAssistantTurn(result.response);
+          const pointAction = getPointAction(result.response.actions);
+          const pointDecision = pointAction ? "point_available" : "no_point_action";
+          console.log("assistant summary:", result.response.summary);
+          console.log("assistant actions:", JSON.stringify(result.response.actions));
+          return {
+            ok: true,
+            response: result.response,
+            debug: buildDebug({
+              pointDecision,
+              pointAction,
+              requestTimedOut: false,
+              responseReceived: true
+            })
+          };
         }
-        if (method === "openCapturedImage") {
-          const { imagePath } = params;
-          const proc = Bun.spawn(["open", imagePath], {
-            stdout: "ignore",
-            stderr: "ignore"
-          });
-          const exitCode = await proc.exited;
-          return { ok: exitCode === 0 };
-        }
-        throw new Error(`Unhandled RPC request: ${String(method)}`);
+        return {
+          ok: false,
+          message: result.message,
+          debug: buildDebug({
+            requestTimedOut: /timed out/i.test(result.message),
+            responseReceived: false
+          })
+        };
+      },
+      showHighlightOverlay: async ({
+        action
+      }) => {
+        await showHighlightOverlay(action);
+        return { ok: true };
+      },
+      clearHighlightOverlay: async () => {
+        await clearHighlightOverlay();
+        return { ok: true };
       }
     }
   }
@@ -4427,6 +5060,114 @@ async function getMainViewUrl() {
   }
   return "views://mainview/index.html";
 }
+function withQuery(url, query) {
+  return url.includes("?") ? `${url}&${query}` : `${url}?${query}`;
+}
+async function ensureOverlayWindow() {
+  if (overlayWindow) {
+    return overlayWindow;
+  }
+  const overlayUrl = withQuery(await getMainViewUrl(), "mode=overlay");
+  overlayWindow = new BrowserWindow({
+    title: "theOP-overlay",
+    url: overlayUrl,
+    titleBarStyle: "hidden",
+    transparent: true,
+    styleMask: {
+      Borderless: true,
+      Titled: false,
+      Closable: false,
+      Miniaturizable: false,
+      Resizable: false,
+      FullSizeContentView: true,
+      NonactivatingPanel: true
+    },
+    frame: {
+      x: 0,
+      y: 0,
+      width: 120,
+      height: 80
+    }
+  });
+  overlayWindow.setAlwaysOnTop(true);
+  overlayWindow.on("close", () => {
+    overlayWindow = null;
+  });
+  return overlayWindow;
+}
+function mapHighlightToScreen(action) {
+  const screenshot = getScreenshotById(action.screenshotId);
+  if (!screenshot) {
+    console.warn("[overlay] screenshot not found for highlight", {
+      screenshotId: action.screenshotId
+    });
+    return null;
+  }
+  const { displayContext } = screenshot;
+  const scaleX = displayContext.bounds.width / displayContext.imageWidth;
+  const scaleY = displayContext.bounds.height / displayContext.imageHeight;
+  return {
+    label: action.label,
+    confidence: action.confidence,
+    x: action.x * scaleX,
+    y: action.y * scaleY,
+    width: action.width * scaleX,
+    height: action.height * scaleY
+  };
+}
+async function clearHighlightOverlay() {
+  if (overlayHideTimeout) {
+    clearTimeout(overlayHideTimeout);
+    overlayHideTimeout = null;
+  }
+  if (!overlayWindow) {
+    return;
+  }
+  try {
+    overlayWindow.webview.executeJavascript(`window.__theopOverlayPendingState = ${JSON.stringify(null)}; window.__theopOverlaySetState?.(window.__theopOverlayPendingState);`);
+  } catch (error) {
+    console.warn("[overlay] failed to clear overlay state", error);
+  }
+  try {
+    await overlayWindow.close();
+  } catch (error) {
+    console.warn("[overlay] failed to close overlay window", error);
+    overlayWindow = null;
+  }
+}
+async function showHighlightOverlay(action) {
+  const payload = mapHighlightToScreen(action);
+  if (!payload) {
+    return;
+  }
+  const screenshot = getScreenshotById(action.screenshotId);
+  if (!screenshot) {
+    return;
+  }
+  const overlay = await ensureOverlayWindow();
+  const bounds = screenshot.displayContext.bounds;
+  const frameX = Math.round(bounds.x + Math.max(0, payload.x - OVERLAY_PADDING));
+  const frameY = Math.round(bounds.y + Math.max(0, payload.y - OVERLAY_LABEL_HEIGHT));
+  const frameWidth = Math.round(payload.width + OVERLAY_PADDING * 2);
+  const frameHeight = Math.round(payload.height + OVERLAY_LABEL_HEIGHT + OVERLAY_PADDING);
+  const localPayload = {
+    ...payload,
+    x: Math.round(payload.x - Math.max(0, payload.x - OVERLAY_PADDING)),
+    y: Math.round(payload.y - Math.max(0, payload.y - OVERLAY_LABEL_HEIGHT)),
+    width: Math.round(payload.width),
+    height: Math.round(payload.height)
+  };
+  overlay.setFrame(frameX, frameY, frameWidth, frameHeight);
+  overlay.show();
+  overlay.webview.executeJavascript(`window.__theopOverlayPendingState = ${JSON.stringify(localPayload)}; window.__theopOverlaySetState?.(window.__theopOverlayPendingState);`);
+  mainWindow.focus();
+  if (overlayHideTimeout) {
+    clearTimeout(overlayHideTimeout);
+  }
+  overlayHideTimeout = setTimeout(() => {
+    clearHighlightOverlay();
+  }, 4000);
+}
 var url = await getMainViewUrl();
 mainWindow = new BrowserWindow({
   title: "theOP",
@@ -4440,7 +5181,7 @@ mainWindow = new BrowserWindow({
     Resizable: false
   },
   frame: {
-    width: CHAR_SIZE,
+    width: WINDOW_WIDTH,
     height: WINDOW_HEIGHT,
     x: 500,
     y: 200

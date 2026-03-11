@@ -1,0 +1,26 @@
+{
+	"name": "theop-cloud-agent",
+	"version": "0.0.1",
+	"private": true,
+	"description": "Cloud Run Gemini multimodal agent for theOP",
+	"scripts": {
+		"dev": "tsx watch src/server.ts",
+		"build": "tsc -p tsconfig.json",
+		"start": "node dist/cloud-agent/src/server.js"
+	},
+	"dependencies": {
+		"@google/genai": "^1.44.0",
+		"@types/ws": "^8.18.1",
+		"cors": "^2.8.5",
+		"express": "^5.1.0",
+		"ws": "^8.19.0",
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"@types/cors": "^2.8.19",
+		"@types/express": "^5.0.4",
+		"@types/node": "^24.7.2",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3"
+	}
+}
